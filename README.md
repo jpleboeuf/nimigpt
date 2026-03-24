@@ -13,6 +13,25 @@ nim c -d:release -d:ssl -r nimigpt.nim
 
 On first run, `input.txt` (a list of 32K names) is downloaded automatically.
 
+## Regression Fixture
+
+The faithful port has a deterministic golden output fixture at `tests/testdata/nimigpt_output_42.txt`.
+
+Generate or refresh it with:
+
+```bash
+nim c tests/gen_fixture.nim
+nim c -d:release -d:ssl nimigpt.nim
+./tests/gen_fixture ./nimigpt tests/testdata/nimigpt_output_42.txt
+```
+
+Check the current program against it with:
+
+```bash
+nim c tests/test_output.nim
+./tests/test_output ./nimigpt tests/testdata/nimigpt_output_42.txt
+```
+
 ## What it does
 
 Trains a tiny GPT (4,192 parameters, 1 layer, 4 heads) on human names for 1,000 steps, then generates 20 new, hallucinated names.
