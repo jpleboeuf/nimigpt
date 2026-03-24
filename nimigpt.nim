@@ -68,29 +68,32 @@ type
 proc newValue(data: float64, children: seq[Value] = @[], localGrads: seq[float64] = @[]): Value =
   Value(data: data, grad: 0.0, children: children, localGrads: localGrads)
 
-proc `+`(val: Value, other: Value): Value = # __add__ (`isinstance(other, Value)`)
-  newValue(val.data + other.data, @[val, other], @[1.0, 1.0])
-proc `+`(val: Value, other: float64): Value = val + newValue(other)
+# Template-based autograd ops
+# `a` and `b` bind the operands: `.data` for `Value`, raw for `float64`.
 
-proc `*`(val: Value, other: Value): Value = # __mul__ (`isinstance(other, Value)`)
-  newValue(val.data * other.data, @[val, other], @[other.data, val.data])
-proc `*`(val: Value, other: float64): Value = val * newValue(other)
+template defCommutativeBinaryOp(name: untyped, fwdExpr, bwdAExpr, bwdBExpr: untyped) =
+  ## `(Value, Value) → Value` with two children in the graph
+  proc name(val1, val2: Value): Value =
+    let a {.inject.} = val1.data
+    let b {.inject.} = val2.data
+    newValue(fwdExpr, @[val1, val2], @[bwdAExpr, bwdBExpr])
+  proc name(val: Value, other: float64): Value =
+    name(val, newValue(other))
+  proc name(other: float64, val: Value): Value =
+    name(val, other)
 
-# In this Nim implementation, `**` has the same precedence as `*` and `/` - use parentheses!
-proc `**`(x, y: float64): float64 = pow(x, y)
+template defBinaryMixedOp(name: untyped, fwdExpr, bwdExpr: untyped) =
+  ## `(Value, float64) → Value` with one child in the graph
+  proc name(val: Value, other: float64): Value =
+    let a {.inject.} = val.data
+    let b {.inject.} = other
+    newValue(fwdExpr, @[val], @[bwdExpr])
 
-proc `**`(val: Value, other: float64): Value = # __pow__
-  newValue(val.data ** other, @[val], @[other * (val.data ** (other - 1))])
-
-proc log(val: Value): Value = # log
-  newValue(ln(val.data), @[val], @[1.0 / val.data])
-
-proc exp(val: Value): Value = # exp
-  newValue(math.exp(val.data), @[val], @[math.exp(val.data)])
-
-proc relu(val: Value): Value = # relu (Rectified Linear Unit)
-  # In Python, `float(self.data > 0)` resolves to 1.0 when `float(True)`, 0.0 when `float(False)`
-  newValue(max(0.0, val.data), @[val], @[float64(ord(val.data > 0))])
+template defUnaryFunc(name: untyped, fwdExpr, bwdExpr: untyped) =
+  ## `(Value) → Value` with one child in the graph
+  proc name(val: Value): Value =
+    let a {.inject.} = val.data
+    newValue(fwdExpr, @[val], @[bwdExpr])
 
 # In Python, `__r*__` methods (e.g. `__radd__`) are called when a non-Value is on the left:
 #   `2.0 + v` → `v.__radd__(2.0)` where `self` is `v` (the Value).
@@ -98,19 +101,37 @@ proc relu(val: Value): Value = # relu (Rectified Linear Unit)
 # Nim doesn't, parameter order must match expression order,
 #  so `val` (Python's `self`) appears second in the `__r*__` procs below.
 
+template defSymmetricBinaryOp(name: untyped, exprShape: untyped) =
+  proc name(val: Value, other: Value | float64): Value =
+    let operand1 {.inject.} = val
+    let operand2 {.inject.} = other
+    exprShape
+  proc name(other: float64, val: Value): Value =
+    let operand1 {.inject.} = other
+    let operand2 {.inject.} = val
+    exprShape
+
+defCommutativeBinaryOp(`+`, a + b, 1.0, 1.0) # __add__ (`isinstance(other, Value)`) / __radd__
+
+defCommutativeBinaryOp(`*`, a * b, b, a) # __mul__ (`isinstance(other, Value)`) / __rmul__
+
+# In this Nim implementation, `^` has exponent-like precedence, unlike Python's `**` spelling where parentheses were required
+proc `^`(x, y: float64): float64 = pow(x, y)
+
+defBinaryMixedOp(`^`, a ^ b, b * a ^ (b - 1)) # __pow__
+
+defUnaryFunc(log, ln(a), 1.0 / a) # log
+
+defUnaryFunc(exp, math.exp(a), math.exp(a)) # exp
+
+# In Python, `float(self.data > 0)` resolves to 1.0 when `float(True)`, 0.0 when `float(False)`
+defUnaryFunc(relu, max(0.0, a), float64(ord(a > 0)))
+
 proc `-`(val: Value): Value = val * (-1.0) # __neg__
 
-proc `+`(other: float64, val: Value): Value = val + other # __radd__(self, other)
+defSymmetricBinaryOp(`-`, operand1 + (-operand2)) # __sub__ / __rsub__
 
-proc `-`(val: Value, other: Value | float64): Value = val + (-other) # __sub__
-
-proc `-`(other: float64, val: Value): Value = other + (-val) # __rsub__(self, other)
-
-proc `*`(other: float64, val: Value): Value = val * other # __rmul__(self, other)
-
-proc `/`(val: Value, other: Value | float64): Value = val * (other ** (-1.0)) # __truediv__
-
-proc `/`(other: float64, val: Value): Value = other * (val ** (-1.0)) # __rtruediv__(self, other)
+defSymmetricBinaryOp(`/`, operand1 * operand2 ^ -1.0) # __truediv__ / __rtruediv__
 
 # Nim's `sum` only works on numeric types, not `Value`
 proc sum(vals: openArray[Value]): Value =
@@ -251,7 +272,7 @@ proc rmsnorm(x: Vector): Vector =
   if x.len == 0:
     raise newException(ValueError, "empty vector")
   let ms = sum(x.mapIt(it * it)) / x.len.float64
-  let scale = (ms + 1e-5) ** (-0.5)
+  let scale = (ms + 1e-5) ^ -0.5
   x.mapIt(it * scale)
 
 proc gpt(tokenId, posId: int, keys, values: var seq[Cache]): Vector =
@@ -275,7 +296,7 @@ proc gpt(tokenId, posId: int, keys, values: var seq[Cache]): Vector =
       let qH = q[hs ..< hs + headDim]
       let kH = keys[li].mapIt(it[hs ..< hs + headDim])
       let vH = values[li].mapIt(it[hs ..< hs + headDim])
-      let attnLogits = kH.mapIt(dot(qH, it) / (headDim.float64 ** 0.5))
+      let attnLogits = kH.mapIt(dot(qH, it) / headDim.float64 ^ 0.5)
       let attnWeights = softmax(attnLogits)
       xAttn.add(weightedSum(attnWeights, vH))
     x = linear(xAttn, state.layers[li].attnWo)
@@ -338,10 +359,10 @@ for step in 0 ..< numSteps:
   let lrT = learningRate * (1.0 - step.float64 / numSteps.float64) # linear learning rate decay
   for i, p in params.pairs:
     m[i] = beta1 * m[i] + (1.0 - beta1) * p.grad
-    v[i] = beta2 * v[i] + (1.0 - beta2) * (p.grad ** 2.0)
-    let mHat = m[i] / (1.0 - (beta1 ** (step + 1).float64))
-    let vHat = v[i] / (1.0 - (beta2 ** (step + 1).float64))
-    p.data -= lrT * mHat / ((vHat ** 0.5) + epsAdam)
+    v[i] = beta2 * v[i] + (1.0 - beta2) * p.grad ^ 2.0
+    let mHat = m[i] / (1.0 - beta1 ^ (step + 1).float64)
+    let vHat = v[i] / (1.0 - beta2 ^ (step + 1).float64)
+    p.data -= lrT * mHat / (vHat ^ 0.5 + epsAdam)
     p.grad = 0.0
 
   stdout.write(&"\rstep {step+1:4} / {numSteps:4} | loss {loss.data:.4f}")
