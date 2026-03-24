@@ -2,8 +2,9 @@
 ## This file is the complete algorithm.
 ## Everything else is just efficiency.
 ##
-## Faithful port of @karpathy's `microgpt.py` to Nim.
+## This started as my faithful Nim port of @karpathy's `microgpt.py` to Nim.
 ## < https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95 >
+## It has since evolved into a more idiomatic Nim-ization.
 ##
 ## Compile and run:
 ##   nim c -d:release -d:ssl -r nimigpt.nim
@@ -16,10 +17,8 @@ import std/random     # randomize, gauss, shuffle, sample
 import std/httpclient # newHttpClient, downloadFile (replaces Python's urllib.request.urlretrieve)
 import std/strformat  # &"" string interpolation
 import std/strutils   # strip
-import std/sequtils   # zip, toSeq, cumsummed
-import std/sugar      # collect
+import std/sequtils   # zip, toSeq, foldl, cumsummed, mapIt
 import std/sets       # HashSet
-import std/tables     # OrderedTable, toOrderedTable
 import std/algorithm  # sort
 import std/unicode    # Rune, runes, `$`
 randomize(42) # Let there be order among chaos.
@@ -33,10 +32,11 @@ if not fileExists("input.txt"):
   let httpClient = newHttpClient()
   httpClient.downloadFile(namesUrl, "input.txt")
   httpClient.close()
-var docs = collect:
-  for line in lines("input.txt"):
-    let s = line.strip()
-    if s.len > 0: s
+var docs: seq[string] = @[]
+for line in lines("input.txt"):
+  let s = line.strip()
+  if s.len > 0:
+    docs.add(s)
 docs.shuffle()
 echo &"num docs: {docs.len}"
 
@@ -114,6 +114,8 @@ proc `/`(other: float64, val: Value): Value = other * (val ** (-1.0)) # __rtrued
 
 # Nim's `sum` only works on numeric types, not `Value`
 proc sum(vals: openArray[Value]): Value =
+  if vals.len == 0:
+    raise newException(ValueError, "empty value sequence")
   result = vals[0]
   for i in 1 ..< vals.len:
     result = result + vals[i]
@@ -134,6 +136,8 @@ proc backward(self: Value) =
   self.grad = 1.0
   for i in countdown(topo.high, 0):
     let v = topo[i]
+    if v.children.len != v.localGrads.len:
+      raise newException(ValueError, "gradient shape mismatch")
     for (child, localGrad) in zip(v.children, v.localGrads):
       child.grad += localGrad * v.grad
 
@@ -146,29 +150,61 @@ const
   blockSize = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
   nHead = 4      # number of attention heads
   headDim = nEmbd div nHead # derived dimension of each head
+
+type
+  Vector = seq[Value]
+  Matrix = seq[Vector]
+  Cache = seq[Vector]
+  LayerWeights = object
+    attnWq: Matrix
+    attnWk: Matrix
+    attnWv: Matrix
+    attnWo: Matrix
+    mlpFc1: Matrix
+    mlpFc2: Matrix
+  ModelState = object
+    wte: Matrix
+    wpe: Matrix
+    lmHead: Matrix
+    layers: seq[LayerWeights]
+
 # equivalent to Python's `matrix = lambda nout, nin, std=0.08: ...`
-proc matrix(nout, nin: int, std: float64 = 0.08): seq[seq[Value]] =
-  collect:
-    for _ in 0 ..< nout:
-      collect:
-        for _ in 0 ..< nin:
-          newValue(gauss(mu = 0.0, sigma = std))
-var stateDict = {
-  "wte": matrix(vocabSize, nEmbd),
-  "wpe": matrix(blockSize, nEmbd),
-  "lm_head": matrix(vocabSize, nEmbd)
-}.toOrderedTable
+proc matrix(nout, nin: int, std: float64 = 0.08): Matrix =
+  result = newSeq[Vector](nout)
+  for i in 0 ..< nout:
+    result[i] = newSeq[Value](nin)
+    for j in 0 ..< nin:
+      result[i][j] = newValue(gauss(mu = 0.0, sigma = std))
+
+var state = ModelState(
+  wte: matrix(vocabSize, nEmbd),
+  wpe: matrix(blockSize, nEmbd),
+  lmHead: matrix(vocabSize, nEmbd),
+  layers: newSeq[LayerWeights](nLayer)
+)
+
 for i in 0 ..< nLayer:
-  stateDict[&"layer{i}.attn_wq"] = matrix(nEmbd, nEmbd)
-  stateDict[&"layer{i}.attn_wk"] = matrix(nEmbd, nEmbd)
-  stateDict[&"layer{i}.attn_wv"] = matrix(nEmbd, nEmbd)
-  stateDict[&"layer{i}.attn_wo"] = matrix(nEmbd, nEmbd)
-  stateDict[&"layer{i}.mlp_fc1"] = matrix(4 * nEmbd, nEmbd)
-  stateDict[&"layer{i}.mlp_fc2"] = matrix(nEmbd, 4 * nEmbd)
-let params = collect: # flatten params into a single seq[Value]
-  for mat in stateDict.values:
+  state.layers[i] = LayerWeights(
+    attnWq: matrix(nEmbd, nEmbd),
+    attnWk: matrix(nEmbd, nEmbd),
+    attnWv: matrix(nEmbd, nEmbd),
+    attnWo: matrix(nEmbd, nEmbd),
+    mlpFc1: matrix(4 * nEmbd, nEmbd),
+    mlpFc2: matrix(nEmbd, 4 * nEmbd)
+  )
+
+proc flattenParams(state: ModelState): seq[Value] =
+  for mat in [state.wte, state.wpe, state.lmHead]:
     for row in mat:
-      for p in row: p
+      for p in row:
+        result.add(p)
+  for layer in state.layers:
+    for mat in [layer.attnWq, layer.attnWk, layer.attnWv, layer.attnWo, layer.mlpFc1, layer.mlpFc2]:
+      for row in mat:
+        for p in row:
+          result.add(p)
+
+let params = flattenParams(state) # flatten params into a single seq[Value]
 echo &"num params: {params.len}"
 
 # --- Model architecture ---
@@ -176,60 +212,83 @@ echo &"num params: {params.len}"
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
 # Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
 
-proc linear(x: seq[Value], w: seq[seq[Value]]): seq[Value] =
-  collect(for wo in w: sum(collect(for (wi, xi) in zip(wo, x): wi * xi)))
+proc addVec(x, y: Vector): Vector =
+  if x.len != y.len:
+    raise newException(ValueError, "vector length mismatch")
+  zip(x, y).mapIt(it[0] + it[1])
 
-proc softmax(logits: seq[Value]): seq[Value] =
-  let maxVal = max(collect(for val in logits: val.data))
-  let exps = collect(for val in logits: (val - maxVal).exp())
+proc dot(x, y: Vector): Value =
+  if x.len == 0:
+    raise newException(ValueError, "empty vector")
+  if x.len != y.len:
+    raise newException(ValueError, "vector length mismatch")
+  zip(x, y).mapIt(it[0] * it[1]).foldl(a + b)
+
+proc weightedSum(weights: Vector, vectors: seq[Vector]): Vector =
+  if vectors.len == 0:
+    raise newException(ValueError, "empty vector list")
+  if weights.len != vectors.len:
+    raise newException(ValueError, "weight/vector count mismatch")
+  for i in 1 ..< vectors.len:
+    if vectors[i].len != vectors[0].len:
+      raise newException(ValueError, "vector length mismatch")
+  result = vectors[0].mapIt(weights[0] * it)
+  for i in 1 ..< vectors.len:
+    result = addVec(result, vectors[i].mapIt(weights[i] * it))
+
+proc linear(x: Vector, w: Matrix): Vector =
+  w.mapIt(dot(it, x))
+
+proc softmax(logits: Vector): Vector =
+  if logits.len == 0:
+    raise newException(ValueError, "empty logits")
+  let maxVal = max(logits.mapIt(it.data))
+  let exps = logits.mapIt((it - maxVal).exp())
   let total = sum(exps)
-  collect(for e in exps: e / total)
+  exps.mapIt(it / total)
 
-proc rmsnorm(x: seq[Value]): seq[Value] =
-  let ms = sum(collect(for xi in x: xi * xi)) / x.len.float64
+proc rmsnorm(x: Vector): Vector =
+  if x.len == 0:
+    raise newException(ValueError, "empty vector")
+  let ms = sum(x.mapIt(it * it)) / x.len.float64
   let scale = (ms + 1e-5) ** (-0.5)
-  collect(for xi in x: xi * scale)
+  x.mapIt(it * scale)
 
-proc gpt(tokenId, posId: int, keys, values: var seq[seq[seq[Value]]]): seq[Value] =
-  let tokEmb = stateDict["wte"][tokenId] # token embedding
-  let posEmb = stateDict["wpe"][posId] # position embedding
-  var x = collect(for (t, p) in zip(tokEmb, posEmb): t + p) # joint token and position embedding
+proc gpt(tokenId, posId: int, keys, values: var seq[Cache]): Vector =
+  let tokEmb = state.wte[tokenId] # token embedding
+  let posEmb = state.wpe[posId] # position embedding
+  var x = addVec(tokEmb, posEmb) # joint token and position embedding
   x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
 
   for li in 0 ..< nLayer:
     # 1) Multi-head Attention block
     var xResidual = x
     x = rmsnorm(x)
-    let q = linear(x, stateDict[&"layer{li}.attn_wq"])
-    let k = linear(x, stateDict[&"layer{li}.attn_wk"])
-    let v = linear(x, stateDict[&"layer{li}.attn_wv"])
+    let q = linear(x, state.layers[li].attnWq)
+    let k = linear(x, state.layers[li].attnWk)
+    let v = linear(x, state.layers[li].attnWv)
     keys[li].add(k)
     values[li].add(v)
-    var xAttn: seq[Value] = @[]
+    var xAttn: Vector = @[]
     for h in 0 ..< nHead:
       let hs = h * headDim
       let qH = q[hs ..< hs + headDim]
-      let kH = collect(for ki in keys[li]: collect(for j in hs ..< hs + headDim: ki[j]))
-      let vH = collect(for vi in values[li]: collect(for j in hs ..< hs + headDim: vi[j]))
-      let attnLogits = collect:
-        for t in 0 ..< kH.len:
-          sum(collect(for j in 0 ..< headDim: qH[j] * kH[t][j])) / (headDim.float64 ** 0.5)
+      let kH = keys[li].mapIt(it[hs ..< hs + headDim])
+      let vH = values[li].mapIt(it[hs ..< hs + headDim])
+      let attnLogits = kH.mapIt(dot(qH, it) / (headDim.float64 ** 0.5))
       let attnWeights = softmax(attnLogits)
-      let headOut = collect:
-        for j in 0 ..< headDim:
-          sum(collect(for t in 0 ..< vH.len: attnWeights[t] * vH[t][j]))
-      xAttn &= headOut
-    x = linear(xAttn, stateDict[&"layer{li}.attn_wo"])
-    x = collect(for (a, b) in zip(x, xResidual): a + b)
+      xAttn.add(weightedSum(attnWeights, vH))
+    x = linear(xAttn, state.layers[li].attnWo)
+    x = addVec(x, xResidual)
     # 2) MLP block
     xResidual = x
     x = rmsnorm(x)
-    x = linear(x, stateDict[&"layer{li}.mlp_fc1"])
-    x = collect(for xi in x: xi.relu())
-    x = linear(x, stateDict[&"layer{li}.mlp_fc2"])
-    x = collect(for (a, b) in zip(x, xResidual): a + b)
+    x = linear(x, state.layers[li].mlpFc1)
+    x = x.mapIt(it.relu())
+    x = linear(x, state.layers[li].mlpFc2)
+    x = addVec(x, xResidual)
 
-  let logits = linear(x, stateDict["lm_head"])
+  let logits = linear(x, state.lmHead)
   return logits
 
 # --- Adam optimizer ---
@@ -252,12 +311,16 @@ for step in 0 ..< numSteps:
 
   # Take single document, tokenize it, surround it with BOS special token on both sides
   let doc = docs[step mod docs.len]
-  let tokens = @[BOS] & collect(for ch in doc.runes: uchars.find(ch)) & @[BOS]
+  var tokens = newSeqOfCap[int](doc.len + 2)
+  tokens.add(BOS)
+  for ch in doc.runes:
+    tokens.add(uchars.find(ch))
+  tokens.add(BOS)
   let n = min(blockSize, tokens.len - 1)
 
   # Forward the token sequence through the model, building up the computation graph all the way to the loss
-  var keys = newSeq[seq[seq[Value]]](nLayer)
-  var values = newSeq[seq[seq[Value]]](nLayer)
+  var keys = newSeq[Cache](nLayer)
+  var values = newSeq[Cache](nLayer)
   var losses: seq[Value] = @[]
   for posId in 0 ..< n:
     let tokenId = tokens[posId]
@@ -290,20 +353,20 @@ for step in 0 ..< numSteps:
 const temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
 echo "\n--- inference (new, hallucinated names) ---"
 for sampleIdx in 0 ..< 20:
-  var keys = newSeq[seq[seq[Value]]](nLayer)
-  var values = newSeq[seq[seq[Value]]](nLayer)
+  var keys = newSeq[Cache](nLayer)
+  var values = newSeq[Cache](nLayer)
   var tokenId = BOS
   var sample = ""
   for posId in 0 ..< blockSize:
     let logits = gpt(tokenId, posId, keys, values)
-    let probs = softmax(collect(for l in logits: l / temperature))
+    let probs = softmax(logits.mapIt(it / temperature))
     # Python: `random.choices(range(vocab_size), weights=[p.data for p in probs])[0]`
     #   picks a random token from `range(vocab_size)` weighted by probability;
     #   returns a 1-element list, so `[0]` extracts the chosen token
     # Nim: `sample(population, cdf)` picks one element directly,
     #   but expects a cumulative distribution function (CDF), a running total of the weights,
     #   e.g. weights [0.1, 0.3, 0.6] → CDF [0.1, 0.4, 1.0]. `cumsummed` does this.
-    tokenId = (0 ..< vocabSize).toSeq.sample(collect(for p in probs: p.data).cumsummed)
+    tokenId = (0 ..< vocabSize).toSeq.sample(probs.mapIt(it.data).cumsummed)
     if tokenId == BOS:
       break
     sample.add($uchars[tokenId])
