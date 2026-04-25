@@ -1,14 +1,21 @@
-import std/os
 import test_common
 
-let exePath = getExePath()
-let fixturePath = getFixturePath()
+let args = parseToolArgs(tkGenFixture)
+var runResult: RunResult
 
-let runResult = runProgram(exePath)
+ensureProgExists(args.fixtureKind, args.progPath)
+ensureTestdataDir()
+ensureFixtureInTestdata(args.fixturePath)
+
+case args.fixtureKind
+  of fkPython:
+    runResult = runProgram("python3", [args.progPath])
+  of fkNim:
+    runResult = runProgram(args.progPath)
+
 if runResult.exitCode != 0:
   stderr.write(runResult.output)
   quit(runResult.exitCode)
 
-createDir(parentDir(fixturePath))
-writeFile(fixturePath, normalizeOutput(runResult.output))
-echo "Wrote fixture to ", fixturePath
+writeFile(args.fixturePath, normalizeOutput(runResult.output))
+echo "Wrote fixture to ", args.fixturePath

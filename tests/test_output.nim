@@ -1,4 +1,3 @@
-import std/os
 import std/strutils
 import std/syncio
 import test_common
@@ -14,23 +13,21 @@ proc mismatchLine(expected, actual: string): int =
     return lineCount + 1
   return 0
 
-let exePath = getExePath()
-let fixturePath = getFixturePath()
+let args = parseToolArgs(tkTestOutput)
 
-if not fileExists(fixturePath):
-  stderr.writeLine("Fixture not found: " & fixturePath)
-  quit(QuitFailure)
+ensureProgExists(fkNim, args.progPath)
+ensureFixtureExists(args.fixturePath)
 
-let runResult = runProgram(exePath)
+let runResult = runProgram(args.progPath)
 if runResult.exitCode != 0:
   stderr.write(runResult.output)
   quit(runResult.exitCode)
 
-let expected = readFile(fixturePath)
+let expected = readFile(args.fixturePath)
 let actual = normalizeOutput(runResult.output)
 if expected != actual:
   let lineNo = mismatchLine(expected, actual)
-  stderr.writeLine("Output mismatch against " & fixturePath)
+  stderr.writeLine("Output mismatch against " & args.fixturePath)
   if lineNo > 0:
     let expectedLines = expected.splitLines()
     let actualLines = actual.splitLines()
@@ -41,4 +38,4 @@ if expected != actual:
       stderr.writeLine("Actual:   " & actualLines[lineNo - 1])
   quit(QuitFailure)
 
-echo "Output matches ", fixturePath
+echo "Output matches ", args.fixturePath

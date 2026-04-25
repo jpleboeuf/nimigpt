@@ -12,18 +12,19 @@
 
 import std/os         # fileExists, lines
 import std/math       # ln, exp, pow
-import std/random     # randomize, gauss, shuffle, sample
 import std/httpclient # newHttpClient, downloadFile (replaces Python's urllib.request.urlretrieve)
 import std/strformat  # &"" string interpolation
 import std/strutils   # strip
-import std/sequtils   # zip, toSeq, cumsummed
+import std/sequtils   # zip, toSeq
 import std/sugar      # collect
 import std/sets       # HashSet
 import std/tables     # OrderedTable, toOrderedTable
 import std/algorithm  # sort
 import std/unicode    # Rune, runes, `$`
-randomize(42) # Let there be order among chaos.
-# Deterministic across Nim runs, but not equivalent to Python's `random.seed(42)`.
+import python_random  # PythonRandom, seed, shuffle, gauss, weightedChoice
+
+var pyRandom: PythonRandom
+pyRandom.seed(42) # Let there be order among chaos.
 
 # --- Dataset ---
 
@@ -37,7 +38,7 @@ var docs = collect:
   for line in lines("input.txt"):
     let s = line.strip()
     if s.len > 0: s
-docs.shuffle()
+pyRandom.shuffle(docs)
 echo &"num docs: {docs.len}"
 
 # --- Tokenizer ---
@@ -152,7 +153,7 @@ proc matrix(nout, nin: int, std: float64 = 0.08): seq[seq[Value]] =
     for _ in 0 ..< nout:
       collect:
         for _ in 0 ..< nin:
-          newValue(gauss(mu = 0.0, sigma = std))
+          newValue(pyRandom.gauss(mu = 0.0, sigma = std))
 var stateDict = {
   "wte": matrix(vocabSize, nEmbd),
   "wpe": matrix(blockSize, nEmbd),
@@ -281,7 +282,9 @@ for step in 0 ..< numSteps:
     p.data -= lrT * mHat / ((vHat ** 0.5) + epsAdam)
     p.grad = 0.0
 
-  stdout.write(&"\rstep {step+1:4} / {numSteps:4} | loss {loss.data:.4f}")
+  if step > 0:
+    stdout.write("\r")
+  stdout.write(&"step {step+1:4} / {numSteps:4} | loss {loss.data:.4f}")
   stdout.flushFile()
 
 # --- Inference ---
@@ -299,11 +302,10 @@ for sampleIdx in 0 ..< 20:
     let probs = softmax(collect(for l in logits: l / temperature))
     # Python: `random.choices(range(vocab_size), weights=[p.data for p in probs])[0]`
     #   picks a random token from `range(vocab_size)` weighted by probability;
-    #   returns a 1-element list, so `[0]` extracts the chosen token
-    # Nim: `sample(population, cdf)` picks one element directly,
-    #   but expects a cumulative distribution function (CDF), a running total of the weights,
-    #   e.g. weights [0.1, 0.3, 0.6] → CDF [0.1, 0.4, 1.0]. `cumsummed` does this.
-    tokenId = (0 ..< vocabSize).toSeq.sample(collect(for p in probs: p.data).cumsummed)
+    #   returns a 1-element list, so `[0]` extracts the chosen token.
+    # Faithful Nim port: `weightedChoice` implements only this weighted single-draw path,
+    #   matching the Python behavior.
+    tokenId = pyRandom.weightedChoice(collect(for p in probs: p.data))
     if tokenId == BOS:
       break
     sample.add($uchars[tokenId])

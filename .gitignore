@@ -7,3 +7,5 @@ nimcache/
 
 # Auto-downloaded dataset
 input.txt
+# Karpathy's `microgpt.py`
+microgpt.py

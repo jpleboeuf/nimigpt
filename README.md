@@ -15,21 +15,41 @@ On first run, `input.txt` (a list of 32K names) is downloaded automatically.
 
 ## Regression Fixture
 
-The faithful port has a deterministic golden output fixture at `tests/testdata/nimigpt_output_42.txt`.
+The faithful port has deterministic golden output fixtures whose names encode the producer and the seed:
+
+- `tests/testdata/microgpt_py_output_42.txt`
+- `tests/testdata/nimigpt_nim_output_42.txt`
+
+Python `microgpt.py` is the source of truth for faithful parity, but `tests/gen_fixture` can generate a fixture from either Python or Nim explicitly.
 
 Generate or refresh it with:
 
 ```bash
+./scripts/download_microgpt.sh
 nim c tests/gen_fixture.nim
-nim c -d:release -d:ssl nimigpt.nim
-./tests/gen_fixture ./nimigpt tests/testdata/nimigpt_output_42.txt
+./tests/gen_fixture --python
 ```
 
-Check the current program against it with:
+Generate a fixture from the Nim executable instead with:
+
+```bash
+nim c -d:release -d:ssl nimigpt.nim
+nim c tests/gen_fixture.nim
+./tests/gen_fixture --nim
+```
+
+Check the current program against the Python fixture with:
 
 ```bash
 nim c tests/test_output.nim
-./tests/test_output ./nimigpt tests/testdata/nimigpt_output_42.txt
+./tests/test_output --python
+```
+
+Check the current program against the Nim fixture with:
+
+```bash
+nim c tests/test_output.nim
+./tests/test_output --nim
 ```
 
 ## What it does
